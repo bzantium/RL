@@ -89,6 +89,10 @@ def test_dataplane_client_abc_surface() -> None:
         "kv_batch_put",
         "kv_batch_get",
         "kv_clear",
+        # recovery/control-plane
+        "ping",
+        "list_metadata",
+        "get_capabilities",
         # lifecycle
         "close",
     }

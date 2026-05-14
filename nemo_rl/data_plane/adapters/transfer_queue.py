@@ -27,6 +27,8 @@ import os
 import socket
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from importlib import resources
 from typing import Any
@@ -35,10 +37,29 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.data_plane.interfaces import (
+    DataPlaneBadRequest,
+    DataPlaneCapabilities,
+    DataPlaneClearError,
     DataPlaneClient,
     DataPlaneConfig,
+    DataPlaneError,
+    DataPlaneGroupMeta,
+    DataPlaneReadError,
+    DataPlaneTimeout,
+    DataPlaneUnavailable,
+    DataPlaneWriteError,
     KVBatchMeta,
 )
+
+try:
+    from ray.exceptions import RayActorError
+except ImportError:
+    G_TQ_UNAVAILABLE_ERROR_TYPES: tuple[type[BaseException], ...] = (
+        ConnectionError,
+        OSError,
+    )
+else:
+    G_TQ_UNAVAILABLE_ERROR_TYPES = (RayActorError, ConnectionError, OSError)
 
 # ──────────────────────────────────────────────────────────────────────────
 # Lazy import of transfer_queue — keeps NeMo-RL importable without TQ
@@ -346,6 +367,63 @@ def _from_wire(td: TensorDict) -> TensorDict:
     return TensorDict(new_dict, batch_size=td.batch_size)
 
 
+def _as_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in {"1", "true", "yes"}
+    return bool(value)
+
+
+G_TQ_UNAVAILABLE_PATTERNS = (
+    "actor",
+    "connection refused",
+    "controller",
+    "crashed",
+    "no controller registered",
+    "storage unit may be overloaded",
+    "zmq recv timeout",
+)
+
+
+def _translate_tq_error(
+    operation: str,
+    exc: BaseException,
+    default_error: type[DataPlaneError],
+) -> DataPlaneError:
+    if isinstance(exc, DataPlaneError):
+        return exc
+    message = f"{operation} failed: {exc}"
+    if isinstance(exc, TimeoutError | FutureTimeoutError):
+        return DataPlaneTimeout(message)
+    if isinstance(exc, G_TQ_UNAVAILABLE_ERROR_TYPES):
+        return DataPlaneUnavailable(message)
+    if isinstance(exc, ValueError | KeyError | TypeError):
+        return DataPlaneBadRequest(message)
+    text = str(exc).lower()
+    if any(pattern in text for pattern in G_TQ_UNAVAILABLE_PATTERNS):
+        return DataPlaneUnavailable(message)
+    return default_error(message)
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Per-partition record kept client-side for register_partition semantics
 # (TQ creates partitions implicitly on first put — this is bookkeeping
@@ -424,6 +502,34 @@ class TQDataPlaneClient(DataPlaneClient):
         self._partitions: dict[str, _PartitionRecord] = {}
         self._closed = False
 
+    def _call_tq(
+        self,
+        operation: str,
+        fn,
+        default_error: type[DataPlaneError],
+        *,
+        timeout_s: float | None = None,
+    ):
+        if timeout_s is None:
+            try:
+                return fn()
+            except Exception as exc:
+                raise _translate_tq_error(operation, exc, default_error) from exc
+
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(fn)
+        try:
+            return future.result(timeout=timeout_s)
+        except FutureTimeoutError as exc:
+            future.cancel()
+            raise DataPlaneTimeout(
+                f"{operation} timed out after {timeout_s}s"
+            ) from exc
+        except Exception as exc:
+            raise _translate_tq_error(operation, exc, default_error) from exc
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
     # ── (A) task-mediated ───────────────────────────────────────────────
 
     def register_partition(
@@ -463,13 +569,17 @@ class TQDataPlaneClient(DataPlaneClient):
             sampling_config["dp_rank"] = dp_rank
 
         while True:
-            tq_meta = client.get_meta(
-                data_fields=list(required_fields),
-                batch_size=int(batch_size),
-                partition_id=partition_id,
-                task_name=task_name,
-                mode="fetch",
-                sampling_config=sampling_config,
+            tq_meta = self._call_tq(
+                "get_meta",
+                lambda: client.get_meta(
+                    data_fields=list(required_fields),
+                    batch_size=int(batch_size),
+                    partition_id=partition_id,
+                    task_name=task_name,
+                    mode="fetch",
+                    sampling_config=sampling_config,
+                ),
+                DataPlaneReadError,
             )
             if getattr(tq_meta, "size", 0) > 0:
                 break
@@ -481,15 +591,19 @@ class TQDataPlaneClient(DataPlaneClient):
                     fields=list(required_fields),
                 )
             if time.time() >= deadline:
-                raise TimeoutError(
+                raise DataPlaneTimeout(
                     f"claim_meta(partition={partition_id}, task={task_name}) "
                     f"timed out after {timeout_s}s"
                 )
             time.sleep(self._poll_interval_s)
 
-        keys: list[str] = client.kv_retrieve_keys(
-            global_indexes=list(tq_meta.global_indexes),
-            partition_id=partition_id,
+        keys: list[str] = self._call_tq(
+            "kv_retrieve_keys",
+            lambda: client.kv_retrieve_keys(
+                global_indexes=list(tq_meta.global_indexes),
+                partition_id=partition_id,
+            ),
+            DataPlaneReadError,
         )
 
         # Lift sequence lengths from the rollout-side `input_lengths` tag
@@ -562,11 +676,15 @@ class TQDataPlaneClient(DataPlaneClient):
                 wire_fields = _promote_1d_leaves(wire_fields)  # type: ignore[bad-argument-type]
             field_names = list(wire_fields.keys())
 
-        self._tq.kv_batch_put(
-            keys=list(keys),
-            partition_id=partition_id,
-            fields=wire_fields,
-            tags=tags,
+        self._call_tq(
+            "kv_batch_put",
+            lambda: self._tq.kv_batch_put(
+                keys=list(keys),
+                partition_id=partition_id,
+                fields=wire_fields,
+                tags=tags,
+            ),
+            DataPlaneWriteError,
         )
 
         rec = self._partitions.get(partition_id)
@@ -588,10 +706,14 @@ class TQDataPlaneClient(DataPlaneClient):
     ) -> TensorDict:
         if not keys:
             return TensorDict({}, batch_size=(0,))
-        td = self._tq.kv_batch_get(
-            keys=list(keys),
-            partition_id=partition_id,
-            select_fields=list(select_fields) if select_fields else None,
+        td = self._call_tq(
+            "kv_batch_get",
+            lambda: self._tq.kv_batch_get(
+                keys=list(keys),
+                partition_id=partition_id,
+                select_fields=list(select_fields) if select_fields else None,
+            ),
+            DataPlaneReadError,
         )
         if self._promote_1d:
             td = _from_wire(td)
@@ -602,17 +724,82 @@ class TQDataPlaneClient(DataPlaneClient):
             rec = self._partitions.pop(partition_id, None)
             keys = list(rec.seen_keys) if rec is not None else []
             if not keys:
-                try:
-                    listing = self._tq.kv_list(partition_id=partition_id)
-                    keys = list(listing.get(partition_id, {}).keys())
-                except Exception:
-                    keys = []
+                listing = self._call_tq(
+                    "kv_list for clear",
+                    lambda: self._tq.kv_list(partition_id=partition_id),
+                    DataPlaneClearError,
+                )
+                keys = list(listing.get(partition_id, {}).keys())
         else:
-            self._partitions.pop(partition_id, None)
+            rec = self._partitions.get(partition_id)
+            if rec is not None:
+                rec.seen_keys.difference_update(keys)
         if keys:
-            self._tq.kv_clear(keys=list(keys), partition_id=partition_id)
+            self._call_tq(
+                "kv_clear",
+                lambda: self._tq.kv_clear(keys=list(keys), partition_id=partition_id),
+                DataPlaneClearError,
+            )
 
-    # ── (C) lifecycle ──────────────────────────────────────────────────
+    # ── (C) recovery/control-plane ─────────────────────────────────────
+
+    def ping(self, timeout_s: float | None = None) -> None:
+        def _ping():
+            client = self._tq.get_client()
+            try:
+                get_partition_list = client.get_partition_list
+            except AttributeError:
+                self._tq.kv_list(partition_id="__nemo_rl_ping__")
+            else:
+                get_partition_list()
+
+        self._call_tq("ping", _ping, DataPlaneReadError, timeout_s=timeout_s)
+
+    def list_metadata(self, partition_id: str) -> list[DataPlaneGroupMeta]:
+        listing = self._call_tq(
+            "kv_list",
+            lambda: self._tq.kv_list(partition_id=partition_id),
+            DataPlaneReadError,
+        )
+        partition_listing = listing.get(partition_id, {})
+        grouped: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+        for key in sorted(partition_listing):
+            tag = partition_listing[key] or {}
+            group_id = str(tag.get("group_id") or key)
+            grouped.setdefault(group_id, []).append((key, tag))
+
+        groups: list[DataPlaneGroupMeta] = []
+        for group_id, rows in grouped.items():
+            keys = [key for key, _ in rows]
+            tags = [tag for _, tag in rows]
+            first_tag = dict(tags[0]) if tags else {}
+            expected_num_keys = _as_int(
+                first_tag.get("expected_num_keys", first_tag.get("num_keys"))
+            )
+            groups.append(
+                DataPlaneGroupMeta(
+                    partition_id=partition_id,
+                    group_id=group_id,
+                    keys=keys,
+                    weight_version=_as_int(first_tag.get("weight_version")),
+                    created_at=_as_float(first_tag.get("created_at")),
+                    committed=all(_as_bool(t.get("committed", False)) for t in tags),
+                    expected_num_keys=expected_num_keys,
+                    size_bytes=_as_int(first_tag.get("size_bytes")),
+                    tags=first_tag,
+                )
+            )
+        return groups
+
+    def get_capabilities(self) -> DataPlaneCapabilities:
+        return DataPlaneCapabilities(
+            supports_persistent_recovery=False,
+            supports_server_side_filtering=False,
+            supports_atomic_batch_put=False,
+            supports_verified_clear=False,
+        )
+
+    # ── (D) lifecycle ──────────────────────────────────────────────────
 
     def close(self) -> None:
         if self._closed:

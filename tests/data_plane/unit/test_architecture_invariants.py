@@ -300,6 +300,12 @@ def test_pack_per_token_field_is_wired_into_writeback() -> None:
         "kv_batch_get",
         "kv_clear",
         "check_consumption_status",
+        "ping",
+        "list_metadata",
+        "depth",
+        "pop",
+        "evict",
+        "get_capabilities",
         "close",
     ],
 )
