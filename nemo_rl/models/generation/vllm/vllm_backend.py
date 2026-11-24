@@ -677,6 +677,9 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
     # Names a co-trained MTP drafter loaded in the current refit, or None
     # before the refit fed it its first batch.
     _mtp_drafter_refit_loaded: Optional[set[str]] = None
+    # Ids of the MTP drafter's modules the current native layerwise refit
+    # reloads, else None.
+    _mtp_drafter_layerwise_reloaded_module_ids: Optional[set[int]] = None
     # Each worker logs the Gemma 4 Unified multimodal filtering at most once.
     _logged_gemma4_unified_drop: bool = False
     _sparse_delta_applier: Any = None
@@ -1319,11 +1322,31 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             return
         weights = self._trim_vocab_padding(draft_model, weights)
         loaded = draft_model.load_weights(weights=weights)
+        if self._nrl_layerwise_reload_active:
+            # The drafter's TRTLLM MoE layers are layerwise reload targets: as in
+            # _load_full_hf_weights, clone the weights a layer keeps for later
+            # replay out of the receive buffer the next transfer overwrites.
+            _detach_pending_layerwise_weights(
+                draft_model,
+                {tensor.untyped_storage().data_ptr() for _, tensor in weights},
+            )
         # A refit arrives in batches, so the names are checked once after the
         # last one, in _maybe_process_mtp_drafter_after_loading.
         if self._mtp_drafter_refit_loaded is None:
             self._mtp_drafter_refit_loaded = set()
         self._mtp_drafter_refit_loaded.update(loaded)
+
+    def _mtp_drafter_layerwise_reload_targets(self) -> list[torch.nn.Module]:
+        """Return the co-trained MTP drafter's modules a native layerwise refit reloads.
+
+        These are the drafter's realized unquantized TRTLLM MoE modules: their
+        runtime layout is a shuffle of the checkpoint layout, so a refit has to
+        restore checkpoint storage and process each layer once, as for the
+        policy model's own TRTLLM experts.
+        """
+        if not self._mtp_drafter_refit_enabled():
+            return []
+        return _unquantized_flashinfer_trtllm_modules(self._get_drafter_model())
 
     def _maybe_process_mtp_drafter_after_loading(self) -> None:
         """Finalize MTP drafter weights after a refit (e.g. MoE grouped-GEMM layout).
@@ -1331,6 +1354,12 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         Mirrors the main-model post-processing so the freshly refit MTP layers
         are converted to their runtime layout. Skipped for the disk-load path,
         which already processes its weights once at startup.
+
+        When drafter modules are native layerwise reload targets of this refit
+        (``_mtp_drafter_layerwise_reloaded_module_ids``), the drafter is
+        finalized as the policy model is: a second
+        ``process_weights_after_loading`` would shuffle their processed weights
+        again.
 
         Raises:
             RuntimeError: If the refit fed the drafter no weights.
@@ -1366,8 +1395,23 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         draft_model_config = (
             self.model_runner.vllm_config.speculative_config.draft_model_config
         )
+        layerwise_reloaded_module_ids = self._mtp_drafter_layerwise_reloaded_module_ids
         with set_current_vllm_config(self.model_runner.vllm_config):
-            process_weights_after_loading(draft_model, draft_model_config, self.device)
+            if layerwise_reloaded_module_ids is None:
+                process_weights_after_loading(
+                    draft_model, draft_model_config, self.device
+                )
+                return
+            from vllm.model_executor.model_loader.reload import (
+                finalize_layerwise_reload,
+            )
+
+            with torch.device(self.device):
+                finalize_layerwise_reload(draft_model, draft_model_config)
+                _process_mxfp8_modules_after_native_reload(
+                    draft_model, layerwise_reloaded_module_ids
+                )
+                _refresh_hpc_modules_after_layerwise_reload(draft_model)
 
     def load_mtp_weights_from_disk(self, model_path: str) -> bool:
         """Load only the MTP (multi-token-prediction) draft weights from disk.
@@ -1764,9 +1808,10 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                     f"{unsupported_placements!r}"
                 )
 
-        if self._mtp_drafter_refit_enabled():
+        if transport == "nccl_reshard" and self._mtp_drafter_refit_enabled():
             raise RuntimeError(
-                "Native layerwise refit does not yet support a co-trained MTP drafter"
+                "nccl-reshard refit does not support a co-trained MTP drafter on "
+                "the native layerwise path; use IPC or collective refit"
             )
 
         self._reject_native_refit_of_trtllm_moe_draft()
@@ -1863,19 +1908,24 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             # union of realized BF16 TRTLLM experts and native MXFP8 linears.
             # Keeping one lifecycle prevents one target family from restoring
             # checkpoint storage after the other has installed runtime layout.
+            # A co-trained MTP drafter adds its own TRTLLM experts to the same
+            # lifecycle, so that its finalizer processes them exactly once.
+            draft_reload_targets = self._mtp_drafter_layerwise_reload_targets()
             if use_deepseek_v4_fp8:
-                reload_targets = [model]
+                candidate_targets = (model, *draft_reload_targets)
             else:
-                reload_targets = []
-                seen_target_ids: set[int] = set()
-                for target in (
+                candidate_targets = (
                     *_unquantized_flashinfer_trtllm_modules(model),
                     *self._get_mxfp8_linear_reload_roots(),
-                ):
-                    if id(target) in seen_target_ids:
-                        continue
-                    seen_target_ids.add(id(target))
-                    reload_targets.append(target)
+                    *draft_reload_targets,
+                )
+            reload_targets = []
+            seen_target_ids: set[int] = set()
+            for target in candidate_targets:
+                if id(target) in seen_target_ids:
+                    continue
+                seen_target_ids.add(id(target))
+                reload_targets.append(target)
             reloaded_module_ids = _reload_target_module_ids(reload_targets)
             initialized_targets: list[torch.nn.Module] = []
             added_skip_tensors: Any = None
@@ -1901,6 +1951,11 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 torch.cuda.synchronize()
 
             try:
+                self._mtp_drafter_layerwise_reloaded_module_ids = (
+                    _reload_target_module_ids(draft_reload_targets)
+                    if draft_reload_targets
+                    else None
+                )
                 with set_current_vllm_config(self.model_runner.vllm_config):
                     with torch.device(self.device):
                         if use_deepseek_v4_fp8:
@@ -1923,6 +1978,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 raise
             finally:
                 self._nrl_layerwise_reload_active = False
+                self._mtp_drafter_layerwise_reloaded_module_ids = None
                 if use_deepseek_v4_fp8:
                     deepseek_v4_fp8.restore_refit(added_skip_tensors, model)
 

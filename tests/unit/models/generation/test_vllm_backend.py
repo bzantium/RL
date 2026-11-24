@@ -1737,7 +1737,7 @@ def test_weight_update_errors_are_fatal_for_native_mxfp8_linear_refit(monkeypatc
 
 
 @pytest.mark.vllm
-def test_unquantized_reload_rejects_cotrained_mtp_during_prepare():
+def test_unquantized_nccl_reshard_reload_rejects_cotrained_mtp():
     from nemo_rl.models.generation.vllm import vllm_backend
 
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
@@ -1750,16 +1750,107 @@ def test_unquantized_reload_rejects_cotrained_mtp_during_prepare():
             quant_config=None,
         ),
     )
+    ext._uses_fp8_kv_cache = lambda: False
     ext._mtp_drafter_refit_enabled = lambda: True
 
+    for transport in ("ipc", "collective"):
+        ext._validate_native_layerwise_refit(transport)
     with pytest.raises(RuntimeError, match="co-trained MTP drafter"):
-        ext.prepare_refit_info({"model.weight": object()})
+        ext._validate_native_layerwise_refit("nccl_reshard")
 
-    assert not hasattr(ext, "state_dict_info")
+
+class _NamedDeferredReloadModel(_DeferredReloadModel):
+    def load_weights(self, weights: list[tuple[str, torch.Tensor]]) -> set[str]:
+        super().load_weights(weights)
+        return {name for name, _ in weights}
 
 
 @pytest.mark.vllm
-def test_native_mxfp8_linear_refit_rejects_cotrained_mtp(monkeypatch):
+def test_layerwise_reload_refits_cotrained_mtp_drafter_experts(monkeypatch):
+    """The drafter's TRTLLM experts join the policy's layerwise reload.
+
+    Its deferred weights survive the reuse of the receive buffer, and its
+    finalizer does not run a second ``process_weights_after_loading``.
+    """
+    from vllm.model_executor.model_loader.reload import record_metadata_for_reloading
+
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    model = _DeferredReloadModel()
+    drafter = _NamedDeferredReloadModel()
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=model,
+        vllm_config=SimpleNamespace(
+            speculative_config=SimpleNamespace(draft_model_config=None),
+            load_config=None,
+            model_config=SimpleNamespace(quantization=None),
+        ),
+    )
+    ext.model_config = None
+    ext.device = torch.device("cpu")
+    ext._uses_unquantized_flashinfer_trtllm = lambda: True
+    ext._validate_native_layerwise_refit = lambda _transport=None: None
+    ext._mtp_drafter_refit_enabled = lambda: True
+    ext._get_drafter_model = lambda: drafter
+    ext._trim_vocab_padding = lambda _model, weights: weights
+    monkeypatch.setattr(
+        vllm_backend,
+        "_unquantized_flashinfer_trtllm_modules",
+        lambda target: [target.layer],
+    )
+    initialized = []
+    from vllm.model_executor.model_loader import reload as vllm_reload
+
+    real_initialize = vllm_reload.initialize_layerwise_reload
+    monkeypatch.setattr(
+        vllm_reload,
+        "initialize_layerwise_reload",
+        lambda target: (initialized.append(target), real_initialize(target))[1],
+    )
+    tracked = []
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.default_loader.DefaultModelLoader",
+        lambda _load_config: SimpleNamespace(
+            track_weights_loading=lambda target, loaded, quantized: tracked.append(
+                (target, loaded, quantized)
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        lambda *_args: pytest.fail(
+            "a layerwise-reloaded drafter must not be processed a second time"
+        ),
+    )
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+    transport_buffer = torch.empty(2)
+    record_metadata_for_reloading(model)
+    record_metadata_for_reloading(drafter)
+
+    with ext._weight_update_lifecycle("collective") as finalize:
+        transport_buffer.copy_(torch.tensor([1.0, 2.0]))
+        ext._maybe_refit_mtp_drafter([("layer.first", transport_buffer)])
+
+        transport_buffer.copy_(torch.tensor([7.0, 8.0]))
+        ext._maybe_refit_mtp_drafter([("layer.second", transport_buffer)])
+        finalize()
+
+    assert initialized == [model.layer, drafter.layer]
+    assert tracked == [(drafter, {"layer.first", "layer.second"}, False)]
+    torch.testing.assert_close(drafter.layer.first, torch.tensor([1.0, 2.0]))
+    torch.testing.assert_close(drafter.layer.second, torch.tensor([7.0, 8.0]))
+    assert ext._mtp_drafter_layerwise_reloaded_module_ids is None
+
+
+@pytest.mark.vllm
+def test_native_mxfp8_linear_refit_accepts_cotrained_mtp(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
     kernel_type = type("FlashInferTrtllmMxfp8LinearKernel", (), {})
@@ -1776,8 +1867,7 @@ def test_native_mxfp8_linear_refit_rejects_cotrained_mtp(monkeypatch):
     ext._uses_fp8_kv_cache = lambda: False
     ext._mtp_drafter_refit_enabled = lambda: True
 
-    with pytest.raises(RuntimeError, match="co-trained MTP drafter"):
-        ext._validate_native_layerwise_refit("collective")
+    ext._validate_native_layerwise_refit("collective")
 
 
 @pytest.mark.vllm
